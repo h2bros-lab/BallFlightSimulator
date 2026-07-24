@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>[그린데일] 클럽 패스 · 페이스 시뮬레이터</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  html,body{ margin:0; padding:0; background:#0d1512; }
+  #root{ min-height:100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/plain" id="source">
+const { useState, useMemo } = React;
+
+/* ============================================================
+   BALL FLIGHT PHYSICS — 순수 함수 (프레임워크 독립적)
+   임팩트: D-Plane 이론 / 비행: 3D 수치적분 (항력 + 마그누스 양력)
+
+   좌표계: x=타겟 방향, y=수직, z=우측
+   마그누스 힘 = 0.5·ρ·Cl·A·v² 방향 (ω̂ × v̂)
+   스핀축이 φ 기울면 ω̂=(0, -sinφ, cosφ) → 양력이
+   수직(cosφ)과 측면(sinφ)으로 분해됨.
+   → 커브가 클수록 캐리가 줄고 측면 편차가 커지는 것이
+     별도 근사 없이 물리에서 자동으로 나온다.
+
+   임팩트 관계 (검증됨):
+     Launch Dir   = Face·ratio + Path·(1-ratio)
+     Face-to-Path = Face - Path
+     Spin Loft    = Dynamic Loft - Attack Angle
+     Spin Axis    = atan( FaceToPath / Spin Loft )
+     Ball Speed   = Club Speed × Smash Factor
+     Backspin     ≈ 4.3 · SpinLoft^0.8 · ClubSpeed (rpm)
+   ============================================================ */
+
+const CLUB_PRESETS = {
+  driver: { faceRatio: 0.85, label: "드라이버", loft: 9, aoa: 2, speed: 100, smash: 1.48, pathSpan: 8, faceSpan: 5, hScale: 1 },
+  iron: { faceRatio: 0.78, label: "미들 아이언", loft: 35, aoa: -4, speed: 85, smash: 1.38, pathSpan: 6.5, faceSpan: 4.5, hScale: 0.8 },
+  wedge: { faceRatio: 0.75, label: "웨지", loft: 58, aoa: -6, speed: 75, smash: 1.25, pathSpan: 5.5, faceSpan: 4.5, hScale: 0.6 },
+};
+
+// 등급별 평균 스윙 프로파일 (트랙맨 통계 경향 기반 교육용 값)
+// 하이핸디: 아웃-인 + 열린 페이스 + 플리핑 / 투어프로: 인-아웃 + 스퀘어 + 디로프트
+const TIERS = {
+  driver: {
+    high: { path: -5, face: 2.5, loft: 13, aoa: -2, speed: 85 },
+    low: { path: -1.5, face: 0.5, loft: 11, aoa: 1, speed: 100 },
+    pro: { path: 1, face: 0, loft: 10, aoa: 2, speed: 115 },
+  },
+  iron: {
+    high: { path: -4, face: 1.5, loft: 39, aoa: -1, speed: 72 },
+    low: { path: -1, face: 0.5, loft: 36, aoa: -3.5, speed: 85 },
+    pro: { path: 0.5, face: 0, loft: 32, aoa: -4.5, speed: 91 },
+  },
+  wedge: {
+    high: { path: -3, face: 1, loft: 62, aoa: -2.5, speed: 64 },
+    low: { path: -0.5, face: 0.5, loft: 59, aoa: -5.5, speed: 75 },
+    pro: { path: 0.5, face: 0, loft: 55, aoa: -7, speed: 86 },
+  },
+};
+const TIER_LABELS = { high: "하이핸디", low: "로우핸디", pro: "투어프로" };
+const TIER_SHORT = { high: "하이", low: "로우", pro: "프로" };
+
+// 투어별 대표 선수 (트랙맨 공개 계측 또는 공개 거리 기록 기반 역산)
+// staticLoft: 선수 실제 드라이버 정적 로프트 (드라이버 선택 시 드롭다운 연동)
+const PLAYERS = {
+  driver: [
+    // 트랙맨 공개 계측: 클럽 ~122mph, 볼 ~181mph, 스핀 ~2,300rpm, Qi4D 실제 8°
+    { tour: "PGA", name: "매킬로이", short: "로리", measured: true, staticLoft: 8, path: 2, face: 1.2, loft: 11.5, aoa: 5, speed: 122 },
+    // 본인 공개 계측: 볼 192-198mph, 스핀 2,200-2,500rpm, 총 322-338yd. 극단적 로우 로프트
+    { tour: "LIV", name: "디섐보", short: "브라이슨", measured: true, staticLoft: 6, path: -0.5, face: 0.5, loft: 9, aoa: 3, speed: 130 },
+    // 상세 계측 미공개 → KPGA 중상위 거리(~283yd) + 정확형 구질에서 역산. GT3 추정 9.5°
+    { tour: "KPGA", name: "박상현", short: "상현", measured: false, staticLoft: 9.5, path: -0.5, face: 0, loft: 10.5, aoa: 1, speed: 106 },
+    // 상세 계측 미공개 → 공개 총거리 280yd에서 역산. 추정 9.5°
+    { tour: "KLPGA", name: "김민솔", short: "민솔", measured: false, staticLoft: 9.5, path: 1, face: 0.3, loft: 13, aoa: 4, speed: 102 },
+  ],
+  iron: [
+    // 7아이언 캐리 195yd(공개)에서 역산. 강한 디로프트 + 다운블로우
+    { tour: "PGA", name: "매킬로이", short: "로리", measured: true, path: 1, face: 0, loft: 31, aoa: -5, speed: 98 },
+    // 여자 투어 장타자 대역(7i 캐리 ~155yd)에서 역산한 추정치
+    { tour: "KLPGA", name: "김민솔", short: "민솔", measured: false, path: 0.5, face: 0.2, loft: 33, aoa: -3, speed: 82 },
+  ],
+  wedge: [],
+};
+
+const AERO = { cd0: 0.21, cdK: 0.30, clK: 2.0, clMax: 0.26 }; // 검증 튜닝값
+const BALL = { m: 0.0459, r: 0.02135, rho: 1.225, g: 9.81 };
+BALL.A = Math.PI * BALL.r * BALL.r;
+const MPH = 0.44704, YD = 0.9144, FT = 0.3048;
+
+function computeLaunchDirection(faceAngle, clubPath, faceRatio) {
+  return faceAngle * faceRatio + clubPath * (1 - faceRatio);
+}
+function computeFaceToPath(faceAngle, clubPath) {
+  return faceAngle - clubPath;
+}
+function computeSpinLoft(dynamicLoft, attackAngle) {
+  return Math.max(2, dynamicLoft - attackAngle);
+}
+function computeSpinAxis(faceToPath, spinLoft) {
+  const deg = (Math.atan2(faceToPath, spinLoft) * 180) / Math.PI;
+  return Math.max(-45, Math.min(45, deg));
+}
+function computeVerticalLaunch(dynamicLoft) {
+  return dynamicLoft * 0.78;
+}
+function computeBallSpeed(clubSpeed, smash) {
+  return clubSpeed * smash;
+}
+function computeBackspin(spinLoft, clubSpeed) {
+  return Math.round(4.3 * Math.pow(spinLoft, 0.8) * clubSpeed);
+}
+
+/* 3D 비행 시뮬레이션
+   반환 pts: [[전방yd, 높이ft, 측면yd], ...] */
+function simulateFlight3D(ballMph, vLaunchDeg, hLaunchDeg, backspinRpm, spinAxisDeg) {
+  const { m, r, rho, g, A } = BALL;
+  const { cd0, cdK, clK, clMax } = AERO;
+  const vl = (vLaunchDeg * Math.PI) / 180;
+  const hl = (hLaunchDeg * Math.PI) / 180;
+  const phi = (spinAxisDeg * Math.PI) / 180;
+  let v = ballMph * MPH;
+  let vx = v * Math.cos(vl) * Math.cos(hl);
+  let vy = v * Math.sin(vl);
+  let vz = v * Math.cos(vl) * Math.sin(hl);
+  let x = 0, y = 0, z = 0, apex = 0;
+  const wxu = 0, wyu = -Math.sin(phi), wzu = Math.cos(phi); // 스핀축 단위벡터
+  const w = (backspinRpm * 2 * Math.PI) / 60;
+  const dt = 0.006;
+  const pts = [[0, 0, 0]];
+  for (let i = 0; i < 5000; i++) {
+    const sp = Math.hypot(vx, vy, vz);
+    const S = (r * w) / sp;
+    const Cd = cd0 + cdK * S;
+    const Cl = Math.min(clMax, clK * S);
+    const Fd = 0.5 * rho * Cd * A * sp * sp;
+    const Fl = 0.5 * rho * Cl * A * sp * sp;
+    const ux = vx / sp, uy = vy / sp, uz = vz / sp;
+    // ω̂ × v̂ (마그누스 방향)
+    let mx = wyu * uz - wzu * uy;
+    let my = wzu * ux - wxu * uz;
+    let mz = wxu * uy - wyu * ux;
+    const mn = Math.hypot(mx, my, mz) || 1;
+    mx /= mn; my /= mn; mz /= mn;
+    const ax = (-Fd * ux + Fl * mx) / m;
+    const ay = (-Fd * uy + Fl * my) / m - g;
+    const az = (-Fd * uz + Fl * mz) / m;
+    vx += ax * dt; vy += ay * dt; vz += az * dt;
+    x += vx * dt; y += vy * dt; z += vz * dt;
+    if (y > apex) apex = y;
+    if (i % 4 === 0) pts.push([x / YD, y / FT, z / YD]);
+    if (y < 0) break;
+  }
+  pts.push([x / YD, 0, z / YD]);
+  const descent = (Math.atan2(-vy, Math.hypot(vx, vz)) * 180) / Math.PI;
+  return { pts, carry: x / YD, side: z / YD, apex: apex / FT, descent };
+}
+
+function classifyShot(launchDir, spinAxis) {
+  const start = launchDir < -1.5 ? "풀" : launchDir > 1.5 ? "푸시" : "스트레이트";
+  const curve =
+    spinAxis < -15 ? "훅" : spinAxis < -3 ? "드로우"
+    : spinAxis > 15 ? "슬라이스" : spinAxis > 3 ? "페이드" : "";
+  if (Math.abs(launchDir) <= 1.5 && Math.abs(spinAxis) <= 3) return "스트레이트";
+  if (start === "스트레이트") return curve || "스트레이트";
+  if (!curve) return start;
+  return `${start} ${curve}`;
+}
+function curveTone(spinAxis) {
+  if (spinAxis < -3) return "draw";
+  if (spinAxis > 3) return "fade";
+  return "straight";
+}
+function ptsToPath(pts) {
+  return pts.map((p, i) => `${i === 0 ? "M" : "L"} ${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(" ");
+}
+
+/* ============================================================ UI ============================================================ */
+
+const TONE = { straight: "#5fa777", fade: "#e8894a", draw: "#4a9fe8" };
+
+function Slider({ label, sub, value, min, max, step, onChange, tone, unit = "°", fmt, hint, marks, marksNote }) {
+  const pct = ((value - min) / (max - min)) * 100;
+  const nudge = (dir) => onChange(
+    Math.min(max, Math.max(min, parseFloat((value + dir * step).toFixed(2))))
+  );
+  return (
+    <div className="ctrl">
+      <div className="ctrl-head">
+        <span className="ctrl-label">{label}{hint && <span className="ctrl-hint">{hint}</span>}</span>
+        <span className="ctrl-val" style={{ color: tone }}>
+          {fmt ? fmt(value) : `${unit === "°" && value > 0 ? "+" : ""}${value.toFixed(unit === "mph" ? 0 : 1)}${unit}`}
+        </span>
+      </div>
+      {marksNote && <div className="ctrl-note">{marksNote}</div>}
+      <div className="ctrl-row">
+        <button className="step-btn" aria-label={`${label} 감소`}
+          disabled={value <= min} onClick={() => nudge(-1)}>−</button>
+        <div className="ctrl-track">
+          <input type="range" min={min} max={max} step={step} value={value}
+            onChange={(e) => onChange(parseFloat(e.target.value))}
+            style={{ background: `linear-gradient(90deg, ${tone} ${pct}%, #24352c ${pct}%)` }} />
+          {marks ? (
+            <div className="ctrl-marks">
+              {marks.filter((m) => m.value >= min && m.value <= max).map((m) => (
+                <span key={m.label} style={{ left: `${((m.value - min) / (max - min)) * 100}%` }}>{m.label}</span>
+              ))}
+            </div>
+          ) : (
+            <div className="ctrl-scale"><span>{sub[0]}</span><span>{sub[1]}</span></div>
+          )}
+        </div>
+        <button className="step-btn" aria-label={`${label} 증가`}
+          disabled={value >= max} onClick={() => nudge(1)}>+</button>
+      </div>
+    </div>
+  );
+}
+function Readout({ label, value, unit, tone, hint, decimals = 1 }) {
+  return (
+    <div className="readout">
+      <div className="readout-label">{label}</div>
+      <div className="readout-value" style={{ color: tone }}>
+        {value > 0 && unit === "°" ? "+" : ""}{value.toFixed(decimals)}<span className="readout-unit">{unit}</span>
+      </div>
+      {hint && <div className="readout-hint">{hint}</div>}
+    </div>
+  );
+}
+
+function BallFlightSimulator() {
+  const [club, setClub] = useState("driver");
+  const [driverLoft, setDriverLoft] = useState(9); // 드라이버 정적 로프트 (드롭다운)
+  const [clubPath, setClubPath] = useState(0);
+  const [faceAngle, setFaceAngle] = useState(0);
+  const [dynamicLoft, setDynamicLoft] = useState(CLUB_PRESETS.driver.loft);
+  const [attackAngle, setAttackAngle] = useState(CLUB_PRESETS.driver.aoa);
+  const [clubSpeed, setClubSpeed] = useState(CLUB_PRESETS.driver.speed);
+  const [unit, setUnit] = useState("m"); // "yd"(yd/ft) | "m"
+  const [view, setView] = useState("3d"); // "3d" | "top" | "side"
+
+  // 정적 로프트: 드라이버는 드롭다운 선택값, 그 외는 클럽 제원
+  const staticLoft = club === "driver" ? driverLoft : CLUB_PRESETS[club].loft;
+  const DRIVER_LOFTS = [6, 8, 9, 9.5, 10.5, 12];
+
+  // 표시 단위 변환 (내부 물리는 항상 yd/ft)
+  const isM = unit === "m";
+  const dU = isM ? "m" : "yd";
+  const hU = isM ? "m" : "ft";
+  const dVal = (yd) => (isM ? yd * 0.9144 : yd);
+  const hVal = (ft) => (isM ? ft * 0.3048 : ft);
+  const sU = isM ? "m/s" : "mph";
+  const sVal = (mph) => (isM ? mph * 0.44704 : mph);
+  const sFmt = (mph) => `${sVal(mph).toFixed(isM ? 1 : 0)}${sU}`;
+
+  const faceRatio = CLUB_PRESETS[club].faceRatio;
+  const smash = CLUB_PRESETS[club].smash;
+
+  function pickClub(k) {
+    setClub(k);
+    setDynamicLoft(k === "driver" ? driverLoft : CLUB_PRESETS[k].loft);
+    setAttackAngle(CLUB_PRESETS[k].aoa);
+    setClubSpeed(CLUB_PRESETS[k].speed);
+    // 수평 값을 새 클럽의 범위 내로 클램프
+    const { pathSpan, faceSpan } = CLUB_PRESETS[k];
+    setClubPath((v) => Math.max(-pathSpan, Math.min(pathSpan, v)));
+    setFaceAngle((v) => Math.max(-faceSpan, Math.min(faceSpan, v)));
+  }
+
+  // 정적 로프트 변경: 다이나믹 로프트를 새 중앙으로 리셋
+  function pickDriverLoft(v) {
+    setDriverLoft(v);
+    setDynamicLoft(v);
+  }
+
+  // 등급 프리셋 적용: 5개 슬라이더 전부 해당 등급 평균값으로
+  function applyTier(t) {
+    const v = TIERS[club][t];
+    setClubPath(v.path);
+    setFaceAngle(v.face);
+    setDynamicLoft(v.loft);
+    setAttackAngle(v.aoa);
+    setClubSpeed(v.speed);
+  }
+  // 선수 프로파일 적용: 드라이버면 그 선수의 정적 로프트까지 함께
+  function applyPlayer(p) {
+    if (club === "driver" && p.staticLoft) setDriverLoft(p.staticLoft);
+    setClubPath(p.path);
+    setFaceAngle(p.face);
+    setDynamicLoft(p.loft);
+    setAttackAngle(p.aoa);
+    setClubSpeed(p.speed);
+  }
+  const matches = (v) =>
+    clubPath === v.path && faceAngle === v.face && dynamicLoft === v.loft
+    && attackAngle === v.aoa && clubSpeed === v.speed;
+  const activeTier = Object.keys(TIERS[club]).find((t) => matches(TIERS[club][t]));
+  const activePlayer = PLAYERS[club].find((p) => matches(p)
+    && (club !== "driver" || !p.staticLoft || driverLoft === p.staticLoft));
+  // 슬라이더 눈금: 등급 + 선수 평균 위치. 범위 밖 제외, 가까운 눈금은 병합(3개↑ 축약)
+  // 반환: { marks, note } — note에 축약된 그룹 전체 명단과 범위 밖 항목 표기
+  function tierMarks(key, min, max) {
+    const all = [
+      ...Object.keys(TIERS[club]).map((t) => ({ value: TIERS[club][t][key], labels: [TIER_SHORT[t]] })),
+      ...PLAYERS[club].map((p) => ({ value: p[key], labels: [p.short] })),
+    ].sort((a, b) => a.value - b.value);
+    const below = all.filter((m) => m.value < min).map((m) => m.labels[0]);
+    const above = all.filter((m) => m.value > max).map((m) => m.labels[0]);
+    const raw = all.filter((m) => m.value >= min && m.value <= max);
+    const merged = [];
+    for (const m of raw) {
+      const last = merged[merged.length - 1];
+      if (last && Math.abs(m.value - last.value) / (max - min) < 0.06) {
+        last.labels.push(...m.labels);
+        last.value = (last.value + m.value) / 2;
+      } else merged.push({ value: m.value, labels: [...m.labels] });
+    }
+    const notes = [];
+    for (const m of merged) {
+      if (m.labels.length > 2) notes.push(`${m.labels[0]}+${m.labels.length - 1} = ${m.labels.join("·")}`);
+    }
+    if (below.length) notes.push(`← 범위 밖: ${below.join("·")}`);
+    if (above.length) notes.push(`범위 밖: ${above.join("·")} →`);
+    return {
+      marks: merged.map((m) => ({
+        value: m.value,
+        label: m.labels.length > 2 ? `${m.labels[0]}+${m.labels.length - 1}` : m.labels.join("·"),
+      })),
+      note: notes.join("  ·  ") || null,
+    };
+  }
+
+  const sim = useMemo(() => {
+    const launchDir = computeLaunchDirection(faceAngle, clubPath, faceRatio);
+    const faceToPath = computeFaceToPath(faceAngle, clubPath);
+    const spinLoft = computeSpinLoft(dynamicLoft, attackAngle);
+    const spinAxis = computeSpinAxis(faceToPath, spinLoft);
+    const vertLaunch = computeVerticalLaunch(dynamicLoft);
+    const ballSpeed = computeBallSpeed(clubSpeed, smash);
+    const backspin = computeBackspin(spinLoft, clubSpeed);
+    const flight = simulateFlight3D(ballSpeed, vertLaunch, launchDir, backspin, spinAxis);
+    // 같은 파워로 스핀축 0(직선)이었다면? → 캐리 손실 계산
+    const straight = simulateFlight3D(ballSpeed, vertLaunch, 0, backspin, 0);
+    const carryLoss = straight.carry - flight.carry;
+    const shot = classifyShot(launchDir, spinAxis);
+    const tone = curveTone(spinAxis);
+    return { launchDir, faceToPath, spinLoft, spinAxis, vertLaunch, ballSpeed, backspin, flight, carryLoss, shot, tone };
+  }, [faceAngle, clubPath, faceRatio, dynamicLoft, attackAngle, clubSpeed, smash]);
+
+  const toneColor = TONE[sim.tone];
+
+  /* 쿼터뷰 사선 투영 (평행): 전방=우상향 대각, 측면=우하향, 높이=수직
+     원근 압축이 없어 직선 샷도 화면 전체에 뻗고 거리 눈금이 겹치지 않는다 */
+  const V = { x0: 30, y0: 214, fx: 1.15, fy: 0.42, sx: 0.55, sy: 0.28, hz: 1.9, half: 30 };
+  const proj = ([fwd, htFt, side]) => [
+    V.x0 + fwd * V.fx + side * V.sx,
+    V.y0 - fwd * V.fy + side * V.sy - (htFt / 3) * V.hz,
+  ];
+  const arcPts = sim.flight.pts.map(proj);
+  const shadowPts = sim.flight.pts.map((p) => proj([p[0], 0, p[2]]));
+  const apexPt3 = sim.flight.pts.reduce((a, b) => (b[1] > a[1] ? b : a));
+  const apexAir = proj(apexPt3);
+  const apexGround = proj([apexPt3[0], 0, apexPt3[2]]);
+  const landPt = proj([sim.flight.carry, 0, sim.flight.side]);
+  const ballPt = proj([0, 0, 0]);
+  const targetFar = proj([290, 0, 0]);
+  // 지면 거리선 (단위별 눈금)
+  const groundTicks = (isM ? [50, 100, 150, 200, 250].map((v) => ({ label: `${v}m`, yd: v / 0.9144 }))
+    : [50, 100, 150, 200, 250].map((v) => ({ label: `${v}yd`, yd: v })));
+  // 클럽 패스 지면 화살 (15yd 앞 지점)
+  const pathTip = proj([15, 0, 15 * Math.tan((clubPath * Math.PI) / 180)]);
+
+  /* 탑뷰 (가로): 전방=우측, 측면=하단이 우측 편차. 전방·측면 동일 스케일 */
+  const T = { x0: 40, yc: 130, scale: 320 / 290 };
+  const topMap = ([fwd, , side]) => [T.x0 + fwd * T.scale, T.yc + side * T.scale];
+  const topPts = sim.flight.pts.map(topMap);
+  const topLand = topMap([sim.flight.carry, 0, sim.flight.side]);
+  const topPathTip = topMap([28, 0, 28 * Math.tan((clubPath * Math.PI) / 180)]);
+
+  /* 측면뷰 (가로): 거리=우측, 높이=상단 */
+  const S = { x0: 40, y0: 216, w: 330, h: 190, maxYd: 290, maxFt: 130 };
+  const sideMap = ([fwd, ht]) => [S.x0 + (fwd / S.maxYd) * S.w, S.y0 - (ht / S.maxFt) * S.h];
+  const sidePts = sim.flight.pts.map((p) => sideMap([p[0], p[1]]));
+  const sideApex = sideMap([apexPt3[0], apexPt3[1]]);
+  const sideLand = sideMap([sim.flight.carry, 0]);
+  const sideHtTicks = (isM ? [15, 30].map((v) => ({ label: `${v}m`, ft: v / 0.3048 }))
+    : [50, 100].map((v) => ({ label: `${v}ft`, ft: v })));
+
+  const startIdx = sim.launchDir < -1.5 ? 0 : sim.launchDir > 1.5 ? 2 : 1;
+  const curveIdx = sim.spinAxis < -3 ? 0 : sim.spinAxis > 3 ? 2 : 1;
+  const MATRIX = [
+    ["풀 드로우", "풀", "풀 페이드"],
+    ["드로우", "스트레이트", "페이드"],
+    ["푸시 드로우", "푸시", "푸시 페이드"],
+  ];
+
+  const axisRad = (sim.spinAxis * Math.PI) / 180;
+  const iC = { x: 356, y: 38, r: 22 }; // 인셋 위치/크기
+  // 백스핀 rpm에 비례한 회전 애니메이션 속도
+  const spinDur = Math.max(0.25, 1800 / Math.max(500, sim.backspin));
+  // 스핀축 인셋: 골프공 + 극점 관통 축 + 축에 수직인 회전 적도 링 (백스핀 방향)
+  const spinInset = (
+    <g>
+      <text x={iC.x} y={iC.y - iC.r - 9} textAnchor="middle" className="svg-note">스핀축</text>
+      {/* 수평 기준선 */}
+      <line x1={iC.x - iC.r - 8} y1={iC.y} x2={iC.x + iC.r + 8} y2={iC.y}
+        stroke="#24352c" strokeWidth="0.8" strokeDasharray="3 3" />
+      {/* 축 기울기만큼 전체 회전 */}
+      <g transform={`rotate(${sim.spinAxis} ${iC.x} ${iC.y})`}>
+        {/* 골프공 */}
+        <circle cx={iC.x} cy={iC.y} r={iC.r} fill="#182420" stroke="#3a4d42" strokeWidth="1" />
+        {/* 딤플 힌트 */}
+        <circle cx={iC.x - 7} cy={iC.y - 6} r="1" fill="#2c4034" />
+        <circle cx={iC.x + 5} cy={iC.y - 9} r="1" fill="#2c4034" />
+        <circle cx={iC.x + 8} cy={iC.y + 6} r="1" fill="#2c4034" />
+        <circle cx={iC.x - 4} cy={iC.y + 9} r="1" fill="#2c4034" />
+        {/* 회전 적도 링 (축에 수직, 백스핀 방향으로 회전 애니메이션) */}
+        <ellipse cx={iC.x} cy={iC.y} rx="7" ry={iC.r - 2}
+          fill="none" stroke={toneColor} strokeWidth="1.6"
+          className="spin-eq" style={{ animationDuration: `${spinDur}s` }} />
+        {/* 백스핀 방향 화살촉 (링 상단, 뒤로 도는 방향) */}
+        <path d={`M ${iC.x - 2} ${iC.y - iC.r + 2} l -4 -2.5 l 1 4.5 z`} fill={toneColor} />
+        {/* 스핀축 (극점 관통선) */}
+        <line x1={iC.x - iC.r - 7} y1={iC.y} x2={iC.x + iC.r + 7} y2={iC.y}
+          stroke={toneColor} strokeWidth="2.2" strokeLinecap="round" />
+        <circle cx={iC.x - iC.r - 7} cy={iC.y} r="2.2" fill={toneColor} />
+        <circle cx={iC.x + iC.r + 7} cy={iC.y} r="2.2" fill={toneColor} />
+      </g>
+      <text x={iC.x} y={iC.y + iC.r + 15} textAnchor="middle" className="svg-note" fill={toneColor}>
+        {sim.spinAxis > 0 ? "+" : ""}{sim.spinAxis.toFixed(1)}° · {sim.backspin}rpm
+      </text>
+    </g>
+  );
+
+  // 시나리오 프리셋: 드라이버 기준값 × 클럽 스케일 (짧은 클럽일수록 패스 변동 작음)
+  const preset = (path, face) => () => {
+    const s = CLUB_PRESETS[club].hScale;
+    setClubPath(Math.round(path * s * 2) / 2);
+    setFaceAngle(Math.round(face * s * 2) / 2);
+  };
+
+  // 각 볼 플라이트를 만드는 [패스, 페이스] 조합 (클럽별 범위 내에서 분류 검증됨)
+  const MATRIX_SETS = {
+    driver: [
+      [[0, -4], [-4, -4], [-6, -2]],
+      [[4, -0.5], [0, 0], [-4, 0.5]],
+      [[6, 2], [4, 4], [0, 4]],
+    ],
+    iron: [
+      [[0, -4], [-4, -4], [-6, -2]],
+      [[4, -0.5], [0, 0], [-4, 0.5]],
+      [[6, 2], [4, 4], [0, 4]],
+    ],
+    wedge: [
+      [[0, -4], [-4, -4], [-5, -1.5]],
+      [[4.5, -1.5], [0, 0], [-4.5, 1.5]],
+      [[5, 1.5], [4, 4], [0, 4]],
+    ],
+  };
+  const MATRIX_SET = MATRIX_SETS[club];
+  // 매트릭스는 스케일 없이 원값 적용 (분류 검증된 조합)
+  const matrixPreset = (p, f) => () => { setClubPath(p); setFaceAngle(f); };
+
+  return (
+    <div className="bfs-root">
+      <style>{CSS}</style>
+
+      <header className="bfs-header">
+        <div>
+          <div className="eyebrow">BALL FLIGHT LAB · D-PLANE + 3D AERODYNAMICS</div>
+          <h1>[그린데일] 클럽 패스 · 페이스 시뮬레이터</h1>
+        </div>
+        <div className="header-right">
+          <div className="unit-toggle">
+            <button className={!isM ? "on" : ""} onClick={() => setUnit("yd")}>yd</button>
+            <button className={isM ? "on" : ""} onClick={() => setUnit("m")}>m</button>
+          </div>
+          <div className="shot-tag" style={{ borderColor: toneColor }}>
+            <span className="shot-tag-label">현재 샷</span>
+            <span className="shot-tag-name" style={{ color: toneColor }}>{sim.shot}</span>
+          </div>
+        </div>
+      </header>
+
+      <div className="bfs-grid">
+        {/* 통합 궤적 뷰 (3D / 탑뷰 / 측면 선택) */}
+        <section className="panel panel-main">
+          <div className="panel-title panel-title-row">
+            <span>볼 트레이서
+              <span className="panel-sub">{view === "3d" ? " 쿼터뷰 · 그림자 = 지면 경로" : view === "top" ? " 위에서 본 좌우 커브" : " 옆에서 본 높이 · 거리"}</span>
+            </span>
+            <div className="view-toggle">
+              <button className={view === "3d" ? "on" : ""} onClick={() => setView("3d")}>3D</button>
+              <button className={view === "top" ? "on" : ""} onClick={() => setView("top")}>탑뷰</button>
+              <button className={view === "side" ? "on" : ""} onClick={() => setView("side")}>측면</button>
+            </div>
+          </div>
+
+          {view === "3d" && (
+          <svg viewBox="0 0 400 260" className="viz">
+            {/* 페어웨이 지면 (평행사변형) */}
+            <path d={(() => {
+              const c = [proj([0, 0, -V.half]), proj([290, 0, -V.half]), proj([290, 0, V.half]), proj([0, 0, V.half])];
+              return `M ${c.map((p) => p.map((v) => v.toFixed(1)).join(" ")).join(" L ")} Z`;
+            })()} fill="#101b15" stroke="#1e2d24" strokeWidth="1" />
+            {/* 타겟 라인 */}
+            <line x1={ballPt[0]} y1={ballPt[1]} x2={targetFar[0]} y2={targetFar[1]}
+              stroke="#2c4034" strokeWidth="1.5" strokeDasharray="4 5" />
+            {/* 지면 거리선 */}
+            {groundTicks.map((t) => {
+              const a = proj([t.yd, 0, -V.half]), b = proj([t.yd, 0, V.half]);
+              return (
+                <g key={t.label}>
+                  <line x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} stroke="#22332a" strokeWidth="1" />
+                  <text x={b[0] + 4} y={b[1] + 9} className="svg-note">{t.label}</text>
+                </g>
+              );
+            })}
+            {/* 클럽 패스 화살 */}
+            <line x1={ballPt[0]} y1={ballPt[1]} x2={pathTip[0]} y2={pathTip[1]}
+              stroke="#7d8d84" strokeWidth="1.5" strokeDasharray="3 3" />
+            <text x={pathTip[0] + 6} y={pathTip[1]} className="svg-note">패스</text>
+            {/* 지면 그림자 (탑다운 정보) */}
+            <path d={ptsToPath(shadowPts)} fill="none" stroke={toneColor} strokeWidth="1.5"
+              strokeDasharray="3 4" opacity="0.45" />
+            {/* 공중 궤적 */}
+            <path d={ptsToPath(arcPts)} fill="none" stroke={toneColor} strokeWidth="3" strokeLinecap="round" />
+            {/* 최고점: 궤적↔그림자 연결선 + 높이 라벨 */}
+            <line x1={apexAir[0]} y1={apexAir[1]} x2={apexGround[0]} y2={apexGround[1]}
+              stroke="#c9b98f" strokeWidth="0.8" strokeDasharray="2 3" opacity="0.6" />
+            <circle cx={apexAir[0]} cy={apexAir[1]} r="3.5" fill="#c9b98f" />
+            <text x={apexAir[0]} y={apexAir[1] - 8} textAnchor="middle" className="svg-note" fill="#c9b98f">
+              {hVal(sim.flight.apex).toFixed(0)}{hU}
+            </text>
+            {/* 착지점 + 측면 편차 라벨 */}
+            <circle cx={landPt[0]} cy={landPt[1]} r="4.5" fill={toneColor} />
+            <text x={landPt[0]} y={landPt[1] + 16} textAnchor="middle" className="svg-land" fill={toneColor}>
+              {sim.flight.side > 0.5 ? "우 " : sim.flight.side < -0.5 ? "좌 " : ""}{dVal(Math.abs(sim.flight.side)).toFixed(0)}{dU}
+            </text>
+            {/* 시작 볼 */}
+            <circle cx={ballPt[0]} cy={ballPt[1]} r="4" fill="#eae7dc" />
+            {spinInset}
+          </svg>
+          )}
+
+          {view === "top" && (
+          <svg viewBox="0 0 400 260" className="viz">
+            {/* 타겟 라인 (수평) */}
+            <line x1={T.x0} y1={T.yc} x2={T.x0 + 290 * T.scale} y2={T.yc}
+              stroke="#2c4034" strokeWidth="1.5" strokeDasharray="4 5" />
+            {/* 거리 눈금 (수직선) */}
+            {groundTicks.map((t) => {
+              const px = T.x0 + t.yd * T.scale;
+              return (
+                <g key={t.label}>
+                  <line x1={px} y1={T.yc - 85} x2={px} y2={T.yc + 85} stroke="#22332a" strokeWidth="1" />
+                  <text x={px} y={T.yc + 100} textAnchor="middle" className="svg-note">{t.label}</text>
+                </g>
+              );
+            })}
+            <text x={T.x0 + 290 * T.scale + 4} y={T.yc - 6} className="svg-note">좌</text>
+            <text x={T.x0 + 290 * T.scale + 4} y={T.yc + 12} className="svg-note">우</text>
+            {/* 클럽 패스 화살 */}
+            <line x1={T.x0} y1={T.yc} x2={topPathTip[0]} y2={topPathTip[1]}
+              stroke="#7d8d84" strokeWidth="1.5" strokeDasharray="3 3" />
+            <text x={topPathTip[0] + 5} y={topPathTip[1] + 3} className="svg-note">패스</text>
+            {/* 궤적 (지면 투영) */}
+            <path d={ptsToPath(topPts)} fill="none" stroke={toneColor} strokeWidth="3" strokeLinecap="round" />
+            <circle cx={topLand[0]} cy={topLand[1]} r="4.5" fill={toneColor} />
+            <text x={topLand[0]} y={topLand[1] + (sim.flight.side >= 0 ? 18 : -10)} textAnchor="middle" className="svg-land" fill={toneColor}>
+              {sim.flight.side > 0.5 ? "우 " : sim.flight.side < -0.5 ? "좌 " : ""}{dVal(Math.abs(sim.flight.side)).toFixed(0)}{dU}
+            </text>
+            <circle cx={T.x0} cy={T.yc} r="4" fill="#eae7dc" />
+            {spinInset}
+          </svg>
+          )}
+
+          {view === "side" && (
+          <svg viewBox="0 0 400 260" className="viz">
+            {/* 지면 */}
+            <line x1={S.x0} y1={S.y0} x2={S.x0 + S.w} y2={S.y0} stroke="#2c4034" strokeWidth="1.5" />
+            {/* 거리 눈금 */}
+            {groundTicks.map((t) => {
+              const [px] = sideMap([t.yd, 0]);
+              return (
+                <g key={t.label}>
+                  <line x1={px} y1={S.y0} x2={px} y2={S.y0 + 4} stroke="#3a4d42" strokeWidth="1" />
+                  <text x={px} y={S.y0 + 16} textAnchor="middle" className="svg-note">{t.label}</text>
+                </g>
+              );
+            })}
+            {/* 높이 눈금 */}
+            {sideHtTicks.map((t) => {
+              const [, py] = sideMap([0, t.ft]);
+              return (
+                <g key={t.label}>
+                  <line x1={S.x0 - 4} y1={py} x2={S.x0 + S.w} y2={py} stroke="#1b291f" strokeWidth="1" />
+                  <text x={S.x0 - 7} y={py + 3} textAnchor="end" className="svg-note">{t.label}</text>
+                </g>
+              );
+            })}
+            {/* 궤적 */}
+            <path d={ptsToPath(sidePts)} fill="none" stroke={toneColor} strokeWidth="3" strokeLinecap="round" />
+            <line x1={sideApex[0]} y1={sideApex[1]} x2={sideApex[0]} y2={S.y0}
+              stroke="#c9b98f" strokeWidth="0.8" strokeDasharray="2 3" opacity="0.5" />
+            <circle cx={sideApex[0]} cy={sideApex[1]} r="3.5" fill="#c9b98f" />
+            <text x={sideApex[0]} y={sideApex[1] - 8} textAnchor="middle" className="svg-note" fill="#c9b98f">
+              {hVal(sim.flight.apex).toFixed(0)}{hU}
+            </text>
+            <circle cx={sideLand[0]} cy={sideLand[1]} r="4.5" fill={toneColor} />
+            <circle cx={S.x0} cy={S.y0} r="3.5" fill="#eae7dc" />
+            {spinInset}
+          </svg>
+          )}
+          <div className="side-stats">
+            <div><span className="ss-label">캐리</span><span className="ss-val">{dVal(sim.flight.carry).toFixed(0)}<i>{dU}</i></span></div>
+            <div><span className="ss-label">측면 편차</span><span className="ss-val">{dVal(Math.abs(sim.flight.side)).toFixed(0)}<i>{dU}</i></span></div>
+            <div><span className="ss-label">최고점</span><span className="ss-val">{hVal(sim.flight.apex).toFixed(0)}<i>{hU}</i></span></div>
+            <div><span className="ss-label">착지각</span><span className="ss-val">{sim.flight.descent.toFixed(0)}<i>°</i></span></div>
+            <div><span className="ss-label">백스핀</span><span className="ss-val">{sim.backspin}<i>rpm</i></span></div>
+            <div className={sim.carryLoss > 1 ? "ss-warn" : ""}>
+              <span className="ss-label">커브 손실</span>
+              <span className="ss-val">{sim.carryLoss > 0.5 ? "-" : ""}{dVal(Math.abs(sim.carryLoss)).toFixed(0)}<i>{dU}</i></span>
+            </div>
+          </div>
+        </section>
+
+        {/* 컨트롤 */}
+        <section className="panel panel-ctrl">
+          <div className="panel-title">컨트롤</div>
+          <div className="club-toggle">
+            {Object.entries(CLUB_PRESETS).map(([k, v]) => (
+              <button key={k} className={club === k ? "on" : ""} onClick={() => pickClub(k)}>
+                <span className="club-name">{v.label}</span>
+                <span className="club-loft">로프트 {k === "driver" ? driverLoft : v.loft}°</span>
+              </button>
+            ))}
+          </div>
+
+          {club === "driver" && (
+            <div className="loft-select">
+              <label>정적 로프트</label>
+              <select value={driverLoft} onChange={(e) => pickDriverLoft(parseFloat(e.target.value))}>
+                {DRIVER_LOFTS.map((l) => <option key={l} value={l}>{l}°</option>)}
+              </select>
+            </div>
+          )}
+
+          <div className="tier-toggle">
+            {Object.keys(TIERS[club]).map((t) => (
+              <button key={t} className={activeTier === t ? "on" : ""} onClick={() => applyTier(t)}>
+                {TIER_LABELS[t]}
+              </button>
+            ))}
+          </div>
+
+          {PLAYERS[club].length > 0 && (
+            <div className="player-row">
+              {PLAYERS[club].map((p) => (
+                <button key={p.name} className={activePlayer === p ? "on" : ""} onClick={() => applyPlayer(p)}>
+                  <span className="player-tour">{p.tour}</span>
+                  <span className="player-name">{p.name}</span>
+                  <span className={`player-spec ${p.measured ? "spec-real" : ""}`}>
+                    {club === "driver" && p.staticLoft ? `${p.staticLoft}° · ` : ""}{p.measured ? "계측" : "추정"}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          <div className="group-label">수평 (좌우 방향 · D-Plane)</div>
+          {(() => {
+            const pm = tierMarks("path", -CLUB_PRESETS[club].pathSpan, CLUB_PRESETS[club].pathSpan);
+            const fm = tierMarks("face", -CLUB_PRESETS[club].faceSpan, CLUB_PRESETS[club].faceSpan);
+            return (<>
+              <Slider label="클럽 패스" sub={["아웃-인 (좌)", "인-아웃 (우)"]}
+                value={clubPath} min={-CLUB_PRESETS[club].pathSpan} max={CLUB_PRESETS[club].pathSpan}
+                step={0.5} onChange={setClubPath} tone="#7d8d84"
+                marks={pm.marks} marksNote={pm.note} />
+              <Slider label="페이스 앵글" sub={["닫힘 (좌)", "열림 (우)"]}
+                value={faceAngle} min={-CLUB_PRESETS[club].faceSpan} max={CLUB_PRESETS[club].faceSpan}
+                step={0.5} onChange={setFaceAngle} tone={toneColor}
+                marks={[{ value: -4, label: "풀" }, ...fm.marks, { value: 4, label: "푸시" }]}
+                marksNote={fm.note} />
+            </>);
+          })()}
+
+          <div className="group-label">수직 (높이 · 스핀 · 거리)</div>
+          {(() => {
+            const lm = tierMarks("loft", staticLoft - 4.5, staticLoft + 4.5);
+            const am = tierMarks("aoa", CLUB_PRESETS[club].aoa - 5, CLUB_PRESETS[club].aoa + 5);
+            const spMax = Math.max(CLUB_PRESETS[club].speed + 25, ...PLAYERS[club].map((p) => p.speed));
+            const sm = tierMarks("speed", CLUB_PRESETS[club].speed - 25, spMax);
+            return (<>
+              <Slider label="다이나믹 로프트" sub={["낮음 (핸드퍼스트)", "높음 (플리핑)"]}
+                hint="정적 로프트 ± 샤프트 린 · 손목 각도 · 타점"
+                value={dynamicLoft} min={staticLoft - 4.5} max={staticLoft + 4.5}
+                step={0.5} onChange={setDynamicLoft} tone="#c9b98f"
+                marks={[
+                  ...(club === "driver" ? [
+                    { value: staticLoft - 3, label: "핸드퍼스트" },
+                    { value: staticLoft - 1.5, label: "하단타점" },
+                  ] : []),
+                  { value: staticLoft, label: `정적${staticLoft}°` },
+                  ...lm.marks]}
+                marksNote={lm.note} />
+              <Slider label="어택 앵글" sub={["다운블로우 -", "어퍼블로우 +"]}
+                value={attackAngle} min={CLUB_PRESETS[club].aoa - 5} max={CLUB_PRESETS[club].aoa + 5}
+                step={0.5} onChange={setAttackAngle} tone="#c9b98f"
+                marks={am.marks} marksNote={am.note} />
+              <Slider label="클럽 스피드" sub={["느림", "빠름"]}
+                value={clubSpeed} min={CLUB_PRESETS[club].speed - 25} max={spMax}
+                step={1} onChange={setClubSpeed} tone="#c9b98f" fmt={sFmt}
+                marks={sm.marks} marksNote={sm.note} />
+            </>);
+          })()}
+
+          <div className="divider" />
+          <div className="readouts">
+            <Readout label="출발 방향" value={sim.launchDir} unit="°" tone="#eae7dc" hint={`페이스 ${(faceRatio * 100).toFixed(0)}% 지배`} />
+            <Readout label="Face-to-Path" value={sim.faceToPath} unit="°" tone={toneColor} hint="수평 성분" />
+            <Readout label="스핀로프트" value={sim.spinLoft} unit="°" tone="#c9b98f" hint="백스핀 크기" />
+            <Readout label="스핀축 기울기" value={sim.spinAxis} unit="°" tone={toneColor}
+              hint={sim.spinAxis > 3 ? "우측 휨" : sim.spinAxis < -3 ? "좌측 휨" : "직진"} />
+            <Readout label="볼 스피드" value={sVal(sim.ballSpeed)} unit={sU} tone="#eae7dc" hint={`스매시 ${smash}`} decimals={isM ? 1 : 0} />
+            <Readout label="수직 발사각" value={sim.vertLaunch} unit="°" tone="#eae7dc" hint="로프트의 78%" />
+          </div>
+
+          <div className="presets">
+            <span>스윙 시나리오</span>
+            <button onClick={preset(0, 0)}>스트레이트</button>
+            <button onClick={preset(3, 1)}>프로 드로우</button>
+            <button onClick={preset(-3, -1)}>프로 페이드</button>
+            <button onClick={preset(-7, -1)}>오버더톱 슬라이스</button>
+            <button onClick={preset(7, 1)}>인-아웃 훅</button>
+            <button onClick={preset(-4, -4)}>당겨침 (풀)</button>
+            <button onClick={preset(4, 4)}>밀어침 (푸시)</button>
+          </div>
+        </section>
+
+        {/* 9-ball */}
+        <section className="panel panel-matrix">
+          <div className="panel-title">9가지 볼 플라이트 <span className="panel-sub">누르면 해당 샷 재현</span></div>
+          <div className="matrix">
+            {MATRIX.map((row, r) =>
+              row.map((cell, c) => {
+                const active = r === startIdx && c === curveIdx;
+                const cellTone = c === 0 ? TONE.draw : c === 2 ? TONE.fade : TONE.straight;
+                const [p, f] = MATRIX_SET[r][c];
+                return (
+                  <button key={`${r}-${c}`} className={`cell ${active ? "cell-on" : ""}`}
+                    onClick={matrixPreset(p, f)}
+                    style={active ? { borderColor: cellTone, color: cellTone, background: `${cellTone}18` } : {}}>
+                    <span className="cell-name">{cell}</span>
+                    <span className="cell-combo">P{p > 0 ? "+" : ""}{p} F{f > 0 ? "+" : ""}{f}</span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+          <div className="matrix-axes"><span>← 좌 · 우 출발 →</span><span>← 드로우 · 페이드 →</span></div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+const CSS = `
+.bfs-root {
+  --deep:#0d1512; --panel:#14201b; --line:#24352c; --chalk:#eae7dc; --muted:#7d8d84;
+  background:var(--deep); color:var(--chalk); min-height:100vh; padding:20px;
+  font-family:ui-sans-serif,system-ui,-apple-system,sans-serif; box-sizing:border-box;
+}
+.bfs-root *{ box-sizing:border-box; }
+.bfs-header{ display:flex; justify-content:space-between; align-items:flex-end; gap:16px; margin-bottom:18px; flex-wrap:wrap; }
+.eyebrow{ font-size:11px; letter-spacing:3px; color:var(--muted); font-weight:600; margin-bottom:4px; }
+.bfs-header h1{ font-size:26px; font-weight:700; letter-spacing:-0.5px; margin:0; }
+.shot-tag{ display:flex; flex-direction:column; align-items:flex-end; padding:8px 16px; border:1px solid; border-radius:3px; background:#0f1814; }
+.header-right{ display:flex; align-items:center; gap:12px; }
+.unit-toggle{ display:flex; border:1px solid var(--line); border-radius:3px; overflow:hidden; }
+.unit-toggle button{ padding:6px 12px; font-size:11px; font-family:ui-monospace,monospace; cursor:pointer; background:#0f1814; color:var(--muted); border:none; transition:all .15s; }
+.unit-toggle button.on{ color:var(--chalk); background:#123020; }
+.shot-tag-label{ font-size:10px; letter-spacing:2px; color:var(--muted); }
+.shot-tag-name{ font-size:22px; font-weight:700; letter-spacing:-0.5px; }
+.bfs-grid{ display:grid; gap:14px; grid-template-columns:1.2fr 1fr; grid-template-areas:"main ctrl" "matrix ctrl"; }
+.panel{ background:var(--panel); border:1px solid var(--line); border-radius:5px; padding:16px; }
+.panel-main{ grid-area:main; } .panel-ctrl{ grid-area:ctrl; }
+.panel-matrix{ grid-area:matrix; }
+.panel-title{ font-size:13px; font-weight:600; letter-spacing:0.5px; margin-bottom:12px; display:flex; align-items:baseline; gap:8px; }
+.panel-title-row{ justify-content:space-between; align-items:center; }
+.view-toggle{ display:flex; border:1px solid var(--line); border-radius:3px; overflow:hidden; }
+.view-toggle button{ padding:5px 11px; font-size:11px; cursor:pointer; background:#0f1814; color:var(--muted); border:none; transition:all .15s; }
+.view-toggle button.on{ color:var(--chalk); background:#123020; }
+.panel-sub{ font-size:11px; color:var(--muted); font-weight:400; letter-spacing:1px; }
+.viz{ width:100%; height:auto; display:block; }
+.svg-note{ font-size:9px; fill:var(--muted); font-family:ui-monospace,monospace; }
+.ctrl-note{ font-size:9px; color:var(--muted); text-align:right; margin:-3px 0 4px; font-family:ui-monospace,monospace; opacity:0.85; }
+.spin-eq{ stroke-dasharray:4 3.5; animation:spinDash linear infinite; }
+@keyframes spinDash{ to{ stroke-dashoffset:15; } }
+@media (prefers-reduced-motion: reduce){ .spin-eq{ animation:none; } }
+.svg-land{ font-size:12px; font-weight:700; font-family:ui-monospace,monospace; }
+.side-stats{ display:grid; grid-template-columns:repeat(6,1fr); gap:6px; margin-top:10px; }
+.side-stats div{ background:#0f1814; border:1px solid var(--line); border-radius:4px; padding:8px 4px; text-align:center; }
+.side-stats .ss-warn{ border-color:#e8894a55; }
+.ss-label{ display:block; font-size:10px; color:var(--muted); margin-bottom:3px; }
+.ss-val{ font-size:17px; font-weight:700; font-family:ui-monospace,monospace; }
+.ss-val i{ font-size:10px; font-style:normal; color:var(--muted); margin-left:1px; }
+.club-toggle{ display:flex; gap:6px; margin-bottom:16px; }
+.club-toggle button{ flex:1; padding:7px 4px; font-size:12px; cursor:pointer; background:#0f1814; color:var(--muted); border:1px solid var(--line); border-radius:3px; transition:all .15s; display:flex; flex-direction:column; gap:2px; align-items:center; font-family:inherit; }
+.club-toggle button.on{ color:var(--chalk); border-color:#5fa777; background:#123020; }
+.club-name{ font-size:12px; }
+.club-loft{ font-size:9px; font-family:ui-monospace,monospace; opacity:0.65; }
+.group-label{ font-size:10px; letter-spacing:1.5px; color:var(--muted); text-transform:uppercase; margin:4px 0 10px; padding-top:6px; border-top:1px solid var(--line); }
+.group-label:first-of-type{ border-top:none; padding-top:0; }
+.ctrl{ margin-bottom:14px; }
+.ctrl-head{ display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px; }
+.ctrl-label{ font-size:13px; font-weight:500; display:flex; flex-direction:column; gap:1px; }
+.ctrl-hint{ font-size:9px; color:var(--muted); font-weight:400; letter-spacing:0.3px; }
+.ctrl-val{ font-size:16px; font-weight:700; font-family:ui-monospace,monospace; }
+.ctrl input[type=range]{ -webkit-appearance:none; appearance:none; width:100%; height:5px; border-radius:3px; outline:none; cursor:pointer; }
+.ctrl-row{ display:flex; align-items:flex-start; gap:8px; }
+.ctrl-track{ flex:1; min-width:0; }
+.ctrl-track input[type=range]{ display:block; margin-top:6px; }
+.step-btn{ flex:none; width:24px; height:24px; margin-top:-3px; padding:0; font-size:15px; line-height:1; cursor:pointer; background:#0f1814; color:var(--muted); border:1px solid var(--line); border-radius:4px; transition:all .15s; font-family:ui-monospace,monospace; }
+.step-btn:hover:not(:disabled){ color:var(--chalk); border-color:#c9b98f; }
+.step-btn:disabled{ opacity:0.3; cursor:default; }
+.ctrl input[type=range]::-webkit-slider-thumb{ -webkit-appearance:none; appearance:none; width:18px; height:18px; border-radius:50%; background:var(--chalk); border:3px solid var(--deep); cursor:pointer; box-shadow:0 0 0 1px var(--line); }
+.ctrl input[type=range]::-moz-range-thumb{ width:18px; height:18px; border-radius:50%; background:var(--chalk); border:3px solid var(--deep); cursor:pointer; }
+.ctrl-scale{ display:flex; justify-content:space-between; margin-top:4px; font-size:9px; color:var(--muted); font-family:ui-monospace,monospace; }
+.ctrl-marks{ position:relative; height:14px; margin-top:5px; }
+.ctrl-marks span{ position:absolute; transform:translateX(-50%); font-size:9px; color:var(--muted); white-space:nowrap; }
+.ctrl-marks span::before{ content:""; position:absolute; left:50%; top:-6px; width:1px; height:4px; background:var(--muted); }
+.tier-toggle{ display:flex; flex-wrap:wrap; gap:6px; margin:2px 0 10px; }
+.tier-toggle button{ flex:1 1 28%; padding:5px 4px; font-size:10px; cursor:pointer; background:#0f1814; color:var(--muted); border:1px solid var(--line); border-radius:3px; transition:all .15s; white-space:nowrap; }
+.tier-toggle button.on{ color:var(--chalk); border-color:#c9b98f; background:#1d2418; }
+.tier-toggle button i{ font-style:normal; font-family:ui-monospace,monospace; opacity:0.65; font-size:9px; }
+.loft-select{ display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+.loft-select label{ font-size:11px; color:var(--muted); letter-spacing:0.5px; }
+.loft-select select{ flex:1; padding:6px 8px; font-size:13px; font-family:ui-monospace,monospace; background:#0f1814; color:var(--chalk); border:1px solid var(--line); border-radius:3px; cursor:pointer; }
+.player-row{ display:flex; flex-wrap:wrap; gap:6px; margin-bottom:14px; }
+.player-row button{ flex:1 1 22%; min-width:72px; padding:6px 4px; cursor:pointer; background:#0f1814; color:var(--muted); border:1px solid var(--line); border-radius:3px; transition:all .15s; display:flex; flex-direction:column; gap:2px; align-items:center; font-family:inherit; }
+.player-row button.on{ color:var(--chalk); border-color:#4a9fe8; background:#101d28; }
+.player-tour{ font-size:8px; letter-spacing:1.5px; color:#4a9fe8; font-weight:700; }
+.player-name{ font-size:12px; font-weight:600; }
+.player-spec{ font-size:9px; font-family:ui-monospace,monospace; opacity:0.6; }
+.player-spec.spec-real{ color:#5fa777; opacity:0.9; }
+.divider{ height:1px; background:var(--line); margin:16px 0; }
+.readouts{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px; }
+.readout{ background:#0f1814; border:1px solid var(--line); border-radius:4px; padding:10px 12px; }
+.readout-label{ font-size:11px; color:var(--muted); letter-spacing:0.5px; margin-bottom:3px; }
+.readout-value{ font-size:22px; font-weight:700; font-family:ui-monospace,monospace; line-height:1; }
+.readout-unit{ font-size:12px; margin-left:1px; }
+.readout-hint{ font-size:10px; color:var(--muted); margin-top:4px; }
+.presets{ display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:16px; }
+.presets span{ font-size:11px; color:var(--muted); margin-right:2px; }
+.presets button{ padding:5px 10px; font-size:11px; cursor:pointer; background:#0f1814; color:var(--chalk); border:1px solid var(--line); border-radius:20px; transition:all .15s; }
+.presets button:hover{ border-color:#5fa777; }
+.matrix{ display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
+.cell{ padding:10px 4px; text-align:center; font-size:12px; border:1px solid var(--line); border-radius:4px; color:var(--muted); background:#0f1814; transition:all .15s; cursor:pointer; display:flex; flex-direction:column; gap:3px; align-items:center; font-family:inherit; }
+.cell:hover{ border-color:#5fa777; color:var(--chalk); }
+.cell-on{ font-weight:700; }
+.cell-name{ font-size:12px; }
+.cell-combo{ font-size:9px; font-family:ui-monospace,monospace; opacity:0.65; }
+.matrix-axes{ display:flex; justify-content:space-between; margin-top:10px; font-size:9px; color:var(--muted); font-family:ui-monospace,monospace; }
+@media (max-width:780px){
+  .bfs-grid{ grid-template-columns:1fr; grid-template-areas:"main" "ctrl" "matrix"; }
+  .side-stats{ grid-template-columns:repeat(3,1fr); }
+}
+`;
+
+
+const styleEl = document.createElement('style');
+styleEl.textContent = CSS;
+document.head.appendChild(styleEl);
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(BallFlightSimulator));
+</script>
+
+<script>
+  const source = document.getElementById('source').textContent;
+  const out = Babel.transform(source, {
+    presets: [['react', { runtime: 'classic' }]],
+  }).code;
+  const script = document.createElement('script');
+  script.textContent = out;
+  document.body.appendChild(script);
+</script>
+</body>
+</html>
