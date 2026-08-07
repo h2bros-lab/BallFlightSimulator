@@ -7,7 +7,7 @@
 <meta name="description" content="포켓몬 태그스타 스타더스트 1탄·2탄 ★6·★5 보스 공략. 보유 태그로 3턴 로테이션과 서포트 티켓을 추천합니다.">
 <meta name="theme-color" content="#120B2E">
 <meta name="color-scheme" content="dark">
-<meta name="version" content="1.5.0">
+<meta name="version" content="1.6.0">
 <meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -528,8 +528,11 @@ summary:focus-visible{outline:2.5px solid var(--cyan);outline-offset:-3px}
 .ver:focus-visible{outline:2.5px solid var(--cyan);outline-offset:2px}
 .ver.done{color:var(--ok);border-color:rgba(124,255,168,.5);background:rgba(124,255,168,.12)}
 .ver.arm{color:var(--bad);border-color:rgba(255,90,90,.55);background:rgba(255,90,90,.12)}
-.adbox{margin:18px 0 4px;min-height:60px}
-.adbox ins{display:block;min-height:60px}
+.adbox{margin:18px 0 4px}
+.adbox ins{display:block;background:transparent;max-height:300px;overflow:hidden}
+/* 광고가 안 채워지면 흰 여백이 남는다. 접어 둔다. */
+ins.adsbygoogle[data-ad-status="unfilled"]{display:none!important}
+.adbox:empty,.adbox:has(ins[data-ad-status="unfilled"]){margin:0}
 footer{margin-top:36px;text-align:center;font-family:var(--mono);font-size:10.5px;color:#6B5AA0;line-height:1.9}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}.chip:hover::after{transform:translateX(-120%)}}
 </style>
@@ -683,7 +686,7 @@ footer{margin-top:36px;text-align:center;font-family:var(--mono);font-size:10.5p
   스탯·기술은 공식·팬페이지 표기값 (1탄 25 · 2탄 25 · 공통 6)<br>
   받는 피해는 보스 표기 기술 기준
   <span class="ver" id="ver" role="button" tabindex="0" title="눌러서 저장값 초기화">
-    v1.5.0 · 2026-08-07</span>
+    v1.6.0 · 2026-08-07</span>
 </footer>
 </div>
 
@@ -954,7 +957,7 @@ const TAGIMG={
 const tagArt=b=>TAGIMG[b.s+'-'+b.n]||null;
 
 const RANK_N=10;          // 순위에 보여줄 개수
-const VERSION='1.5.0';
+const VERSION='1.6.0';
 const BUILT='2026-08-07';
 
 /* ══ 자산을 CSS 로 한 번만 심는다 (DOM 에 base64 중복 방지) ══ */
