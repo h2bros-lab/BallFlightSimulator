@@ -7,7 +7,7 @@
 <meta name="description" content="포켓몬 태그스타 스타더스트 1탄·2탄 ★6 보스 공략. 보유 태그로 3턴 로테이션과 서포트 티켓을 추천합니다.">
 <meta name="theme-color" content="#120B2E">
 <meta name="color-scheme" content="dark">
-<meta name="version" content="1.1.0">
+<meta name="version" content="1.2.0">
 <meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -552,7 +552,7 @@ footer{margin-top:36px;text-align:center;font-family:var(--mono);font-size:10.5p
 <div class="viewsw" role="group" aria-label="화면 전환">
   <button id="vB" aria-pressed="true">공략</button>
   <button id="vC" aria-pressed="false">컬렉션 <span class="ct" id="vCct"></span></button>
-  <button id="vX" aria-pressed="false">보정 <span class="ct" id="vXct"></span></button>
+  <button id="vX" aria-pressed="false">룰렛 보정 <span class="ct" id="vXct"></span></button>
 </div>
 
 <div id="viewBattle" data-d="0">
@@ -609,7 +609,7 @@ footer{margin-top:36px;text-align:center;font-family:var(--mono);font-size:10.5p
 
 <div id="viewChance" hidden>
   <section>
-    <div class="sec-head"><h2>공격 찬스 보정</h2><span class="hint">기믹별 룰렛값 · 공격력에 가산</span></div>
+    <div class="sec-head"><h2>룰렛 보정</h2><span class="hint">기믹별 룰렛값 · 공격력에 가산</span></div>
     <div class="card">
       <p style="font-size:12.5px;color:var(--ink-dim);margin:0 0 14px;line-height:1.7">
         룰렛에서 뜬 숫자가 공격력에 그대로 더해집니다. 다이맥스는 태그의 다이맥스 레벨에 따라
@@ -662,7 +662,7 @@ footer{margin-top:36px;text-align:center;font-family:var(--mono);font-size:10.5p
   스탯·기술은 공식·팬페이지 표기값 (1탄 25 · 2탄 25 · 공통 6)<br>
   받는 피해는 보스 표기 기술 기준
   <span class="ver" id="ver" role="button" tabindex="0" title="눌러서 저장값 초기화">
-    v1.1.0 · 2026-08-07</span>
+    v1.2.0 · 2026-08-07</span>
 </footer>
 </div>
 
@@ -933,7 +933,7 @@ const TAGIMG={
 const tagArt=b=>TAGIMG[b.s+'-'+b.n]||null;
 
 const RANK_N=10;          // 순위에 보여줄 개수
-const VERSION='1.1.0';
+const VERSION='1.2.0';
 const BUILT='2026-08-07';
 
 /* ══ 자산을 CSS 로 한 번만 심는다 (DOM 에 base64 중복 방지) ══ */
@@ -1086,11 +1086,17 @@ function buildSeq(boss,mode){
   opts.push({c:RANDOM.c,m:null,mega:false,base:RANDOM,val:0,rand:true});
 
   const maxOne=Math.max(...opts.map(o=>o.val));
-  let bestSeq=null, bestVal=-1;
+  // 합계가 같으면 큰 피해를 앞턴에. 보스가 먼저 쓰러질 수 있어 앞이 유리하다.
+  let bestSeq=null, bestVal=-1, bestTie=-1;
   const acc=[];
-  const step=(turn,prev,used,val)=>{
-    if(turn===3){ if(val>bestVal){bestVal=val;bestSeq=acc.slice()} return }
-    if(val + (3-turn)*maxOne <= bestVal) return;          // 가지치기
+  const step=(turn,prev,used,val,tie)=>{
+    if(turn===3){
+      if(val>bestVal+1e-9 || (Math.abs(val-bestVal)<=1e-9 && tie>bestTie)){
+        bestVal=val; bestTie=tie; bestSeq=acc.slice();
+      }
+      return;
+    }
+    if(val + (3-turn)*maxOne < bestVal-1e-9) return;      // 가지치기 (동점은 살려 둔다)
     for(const o of opts){
       if(!o.rand){                                         // 랜덤은 탈진·중복 제약 없음
         if(prev===o.c.id) continue;                        // 탈진
@@ -1102,11 +1108,11 @@ function buildSeq(boss,mode){
       let nu=used;
       const gk = (o.m && o.m.tagx) || (mega ? '메가진화' : null);
       if(gk){ nu=new Set(used); nu.add(gk) }
-      step(turn+1,o.c.id,nu,val+o.val);
+      step(turn+1,o.c.id,nu,val+o.val,tie+o.val*(3-turn));
       acc.pop();
     }
   };
-  step(0,null,new Set(),0);
+  step(0,null,new Set(),0,0);
   return bestSeq||[];
 }
 
